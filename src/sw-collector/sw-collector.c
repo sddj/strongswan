@@ -35,6 +35,10 @@
 
 #include <swid_gen/swid_gen.h>
 #include <swid_gen/swid_gen_info.h>
+
+#define DEFAULT_HISTORY_LOG		"/var/log/apt/history.log"
+#define NO_ITERATION			-1
+
 /**
  * global debug output variables
  */
@@ -223,49 +227,26 @@ static collector_op_t do_args(int argc, char *argv[], bool *full_tags,
 }
 
 /**
- * Extract software events from apt history log files
+ * Extract software events from a specific apt history log file
  */
-static int extract_history(sw_collector_db_t *db)
+static int extract_history_file(sw_collector_db_t *db,
+								sw_collector_history_t *history, char *last_time,
+								uint32_t last_eid, char *path, int level)
 {
-	sw_collector_history_t *history = NULL;
-	uint32_t epoch, last_eid, eid = 0;
-	char *history_path, *last_time = NULL, rfc_time[21];
 	chunk_t *h, history_chunk, line, cmd;
+	char rfc_time[21], *new_path = NULL;
 	int status = EXIT_FAILURE;
-	bool skip = TRUE;
+	bool skip = TRUE, first_skip = TRUE;
+	size_t len;
+	uint32_t eid = 0;
 
-	/* open history file for reading */
-	history_path = lib->settings->get_str(lib->settings, "%s.history", NULL,
-										  lib->ns);
-	if (!history_path)
-	{
-		fprintf(stderr, "sw-collector.history path not set.\n");
-		return EXIT_FAILURE;
-	}
-	h = chunk_map(history_path, FALSE);
+	h = chunk_map(path, FALSE);
 	if (!h)
 	{
-		fprintf(stderr, "opening '%s' failed: %s", history_path,
-				strerror(errno));
+		fprintf(stderr, "opening '%s' failed: %s", path, strerror(errno));
 		return EXIT_FAILURE;
 	}
 	history_chunk = *h;
-
-	/* Instantiate history extractor */
-	history = sw_collector_history_create(db, 1);
-	if (!history)
-	{
-		chunk_unmap(h);
-		return EXIT_FAILURE;
-	}
-
-	/* retrieve last event in database */
-	if (!db->get_last_event(db, &last_eid, &epoch, &last_time) || !last_eid)
-	{
-		goto end;
-	}
-	DBG0(DBG_IMC, "Last-Event: %s, eid = %u, epoch = %u",
-				   last_time, last_eid, epoch);
 
 	/* parse history file */
 	while (fetchline(&history_chunk, &line))
@@ -289,8 +270,23 @@ static int extract_history(sw_collector_db_t *db)
 			/* have we reached new history entries? */
 			if (skip && strcmp(rfc_time, last_time) > 0)
 			{
+				if (first_skip && level != NO_ITERATION)
+				{
+					DBG0(DBG_IMC, "   Warning: %s of first entry on level %d"
+								  " is newer", rfc_time, level);
+
+					/* try to parse history log on next level */
+					len = strlen(path) + 3;
+					new_path = malloc(len);
+					snprintf(new_path, len, DEFAULT_HISTORY_LOG ".%d", ++level);
+					extract_history_file(db, history, last_time, last_eid,
+										 new_path, level);
+					free(new_path);
+				}
 				skip = FALSE;
 			}
+			first_skip = FALSE;
+
 			if (skip)
 			{
 				continue;
@@ -302,8 +298,7 @@ static int extract_history(sw_collector_db_t *db)
 			{
 				goto end;
 			}
-			DBG1(DBG_IMC, "Start-Date: %s, eid = %u, epoch = %u",
-						   rfc_time, eid, epoch);
+			DBG1(DBG_IMC, "Start-Date: %s, eid = %u", rfc_time, eid);
 		}
 		else if (skip)
 		{
@@ -352,17 +347,58 @@ static int extract_history(sw_collector_db_t *db)
 			}
 		}
 	}
+	status = EXIT_SUCCESS;
 
-	if (history->merge_installed_packages(history))
+end:
+	chunk_unmap(h);
+
+	return status;
+}
+
+/**
+ * Extract software events from apt history log files
+ */
+static int extract_history(sw_collector_db_t *db)
+{
+	sw_collector_history_t *history = NULL;
+	uint32_t epoch, last_eid;
+	int status = EXIT_FAILURE;
+	char *path, *last_time = NULL;
+	int level;
+
+	/* open history file for reading */
+	path = lib->settings->get_str(lib->settings, "%s.history",
+								  DEFAULT_HISTORY_LOG, lib->ns);
+
+	/* retrieve last event in database */
+	if (!db->get_last_event(db, &last_eid, &epoch, &last_time) || !last_eid)
 	{
-		status = EXIT_SUCCESS;
+		goto end;
 	}
+	DBG0(DBG_IMC, "Last-Event: %s, eid = %u, epoch = %u",
+				   last_time, last_eid, epoch);
+
+	/* iterate through history log files in the default path only */
+	level = streq(path, DEFAULT_HISTORY_LOG) ? 0 : NO_ITERATION;
+
+	history = sw_collector_history_create(db, 1);
+	if (!history)
+	{
+		goto end;
+	}
+
+	status = extract_history_file(db, history, last_time, last_eid, path, level);
+	if (status == EXIT_SUCCESS)
+	{
+		if (!history->merge_installed_packages(history))
+		{
+			status = EXIT_FAILURE;
+		}
+	}
+	history->destroy(history);
 
 end:
 	free(last_time);
-	history->destroy(history);
-	chunk_unmap(h);
-
 	return status;
 }
 
@@ -716,8 +752,10 @@ int main(int argc, char *argv[])
 	switch (op)
 	{
 		case COLLECTOR_OP_EXTRACT:
+		{
 			status = extract_history(db);
 			break;
+		}
 		case COLLECTOR_OP_LIST:
 			status = list_identifiers(db, query_type);
 			break;
