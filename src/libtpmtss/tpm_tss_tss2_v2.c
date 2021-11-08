@@ -3,6 +3,8 @@
  * Copyright (C) 2018-2020 Andreas Steffen
  * HSR Hochschule fuer Technik Rapperswil
  *
+ * Copyright (C) 2021 Andreas Steffen, strongSec GmbH
+ *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
  * Free Software Foundation; either version 2 of the License, or (at your
@@ -1214,13 +1216,222 @@ METHOD(tpm_tss_t, sign, bool,
 	return TRUE;
 }
 
+static bool start_auth_session(private_tpm_tss_tss2_t *this, uint32_t ek_handle)
+{
+	uint32_t rval;
+	size_t hash_len;
+	nonce_gen_t *nonce_gen;
+	bool success = FALSE;
+
+	TPM2B_PUBLIC public = { 0, };;
+	TPM2B_NONCE nonceCaller = {0, };
+	TPM2B_NONCE nonceTPM = {0, };
+	TPM2B_ENCRYPTED_SECRET encryptedSalt;
+	TPM2_SE sessionType = TPM2_SE_HMAC;
+	TPMT_SYM_DEF symmetric = { .algorithm = TPM2_ALG_AES,
+		                       .keyBits.sym = 256,
+		                       .mode.sym = TPM2_ALG_CFB };
+	TPMI_ALG_HASH authHash;
+	TPMI_SH_AUTH_SESSION sessionHandle;
+
+	if (!read_public(this, ek_handle, &public))
+	{
+		return FALSE;
+	}
+
+	authHash = public.publicArea.nameAlg;
+
+	/* Determine key hash size */
+	switch (authHash)
+	{
+		case TPM2_ALG_SHA1:
+			hash_len = TPM2_SHA1_DIGEST_SIZE;
+			break;
+		case TPM2_ALG_SHA256:
+		case TPM2_ALG_SHA3_256:
+			hash_len = TPM2_SHA256_DIGEST_SIZE;
+			break;
+		case TPM2_ALG_SHA384:
+		case TPM2_ALG_SHA3_384:
+			hash_len = TPM2_SHA384_DIGEST_SIZE;
+			break;
+		case TPM2_ALG_SHA512:
+		case TPM2_ALG_SHA3_512:
+			hash_len = TPM2_SHA512_DIGEST_SIZE;
+			break;
+		case TPM2_ALG_SM3_256:
+			hash_len = TPM2_SM3_256_DIGEST_SIZE;
+			break;
+		default:
+			DBG1(DBG_PTS, "%s unsupported key hash algorithm", LABEL);
+			return FALSE;
+	}
+
+	nonce_gen = lib->crypto->create_nonce_gen(lib->crypto);
+	if (!nonce_gen)
+	{
+		DBG1(DBG_PTS, "no nonce generator available");
+		return FALSE;
+	}
+
+	switch (public.publicArea.type)
+	{
+		case TPM2_ALG_RSA:
+		{
+			encryption_scheme_t encryption_scheme;
+			public_key_t *pubkey = NULL;
+			uint8_t salt_buffer[HASH_SIZE_SHA512];
+			chunk_t salt = { salt_buffer, sizeof(salt_buffer) };
+			chunk_t encrypted_salt = chunk_empty;
+			chunk_t label = chunk_from_chars('S','E','C','R','E','T', 0x00);
+			chunk_t rsa_modulus;
+			chunk_t rsa_exponent = chunk_from_chars(0x01, 0x00, 0x01);
+			uint32_t exponent;
+			bool ret;
+
+			TPM2B_PUBLIC_KEY_RSA *rsa;
+
+			DBG2(DBG_PTS, "%s EK RSA handle: 0x%08x with hash len of %u bytes",
+				 LABEL, ek_handle, hash_len);
+
+			salt.len = hash_len;
+			if (!nonce_gen->get_nonce(nonce_gen, salt.len, salt.ptr))
+			{
+				DBG1(DBG_PTS, "generation of salt nonce failed");
+				goto error;
+			}
+
+			/**
+			 * When encrypting salts, the encryption scheme of a key is ignored
+			 * and TPM2_ALG_OAEP is always used.
+			 */
+			public.publicArea.parameters.rsaDetail.scheme.scheme = TPM2_ALG_OAEP;
+
+			switch (authHash)
+			{
+				case TPM2_ALG_SHA1:
+					encryption_scheme = ENCRYPT_RSA_OAEP_SHA1;
+					break;
+				case TPM2_ALG_SHA256:
+					encryption_scheme = ENCRYPT_RSA_OAEP_SHA256;
+					break;
+				case TPM2_ALG_SHA384:
+					encryption_scheme = ENCRYPT_RSA_OAEP_SHA384;
+					break;
+				case TPM2_ALG_SHA512:
+					encryption_scheme = ENCRYPT_RSA_OAEP_SHA512;
+					break;
+				default:
+					DBG1(DBG_PTS, "%s unsupported key hash algorithm", LABEL);
+					goto error;
+			}
+
+			/* get RSA public key */
+			rsa = &public.publicArea.unique.rsa;
+			rsa_modulus = chunk_create(rsa->buffer, rsa->size);
+			exponent = htonl(public.publicArea.parameters.rsaDetail.exponent);
+			if (exponent)
+			{
+				rsa_exponent = chunk_from_thing(exponent);
+			}
+			pubkey = lib->creds->create(lib->creds, CRED_PUBLIC_KEY, KEY_RSA,
+						BUILD_RSA_MODULUS, rsa_modulus, BUILD_RSA_PUB_EXP,
+						rsa_exponent, BUILD_END);
+			if (!pubkey)
+			{
+				DBG1(DBG_PTS, "retrieval of EK public key failed");
+				goto error;
+			}
+
+			ret = pubkey->encrypt(pubkey, encryption_scheme, &label, salt,
+										 &encrypted_salt);
+			pubkey->destroy(pubkey);
+
+			if (!ret)
+			{
+				DBG1(DBG_PTS, "encryption of salt failed");
+				goto error;
+			}
+
+			encryptedSalt.size = encrypted_salt.len;
+			memcpy(encryptedSalt.secret, encrypted_salt.ptr, encrypted_salt.len);
+			free(encrypted_salt.ptr);
+			break;
+		}
+		case TPM2_ALG_ECC:
+			DBG2(DBG_PTS, "%s EK ECC handle: 0x%08x with hash len of %u bytes", LABEL, ek_handle, hash_len);
+			/* r = iesys_crypto_get_ecdh_point(&pub, sizeof(TPMU_ENCRYPTED_SECRET),
+                                        &Z, &Q,
+                                        (BYTE *) &encryptedSalt->secret[0],
+                                       &cSize);
+			return_if_error(r, "During computation of ECC public key.");
+			encryptedSalt->size = cSize;
+			*/
+			/* Compute salt from Z with KDFe */
+			/*
+			r = iesys_crypto_KDFe(tpmKeyNode->rsrc.misc.
+                              rsrc_key_pub.publicArea.nameAlg,
+                              &Z, "SECRET", &Q.x,
+                              &pub.publicArea.unique.ecc.x,
+                              keyHash_size*8,
+                              &esys_context->salt.buffer[0]);
+			return_if_error(r, "During KDFe computation.");
+			esys_context->salt.size = keyHash_size;
+			 */
+			break;
+		default:
+			DBG1(DBG_PTS, "%s unsupported key type", LABEL);
+			return FALSE;
+	}
+
+	nonceCaller.size = hash_len;
+	if (!nonce_gen->get_nonce(nonce_gen, nonceCaller.size, nonceCaller.buffer))
+	{
+		DBG1(DBG_PTS, "generation of nonceCaller failed");
+		goto error;
+	}
+
+	this->mutex->lock(this->mutex);
+	rval = Tss2_Sys_StartAuthSession(this->sys_context, ek_handle, TPM2_RH_NULL,
+				NULL, &nonceCaller, &encryptedSalt, sessionType,
+				&symmetric, authHash, &sessionHandle, &nonceTPM, NULL);
+	this->mutex->unlock(this->mutex);
+	if (rval != TSS2_RC_SUCCESS)
+	{
+		DBG1(DBG_PTS,"%s Tss2_Sys_StartAuthSession failed: 0x%06x", LABEL, rval);
+		goto error;
+    }
+    success = TRUE;
+
+error:
+	nonce_gen->destroy(nonce_gen);
+
+    return success;
+}
+
 METHOD(tpm_tss_t, get_random, bool,
 	private_tpm_tss_tss2_t *this, size_t bytes, uint8_t *buffer)
 {
-	size_t len, random_len= sizeof(TPM2B_DIGEST)-2;
+	size_t len, random_len = sizeof(TPM2B_DIGEST)-2;
 	TPM2B_DIGEST random = { random_len, };
 	uint8_t *pos = buffer;
-	uint32_t rval;
+	uint32_t rval, ek_handle = 0;
+	char *handle_str;
+	chunk_t handle_chunk;
+
+	/* Get Endorsement Key (EK) handle from settings */
+	handle_str = lib->settings->get_str(lib->settings,
+								"%s.plugins.tpm.ek_handle", NULL, lib->ns);
+	if (handle_str)
+	{
+		handle_chunk = chunk_from_hex(chunk_from_str(handle_str),
+									 (char *)&ek_handle);
+		ek_handle = (handle_chunk.len == 4) ? htonl(ek_handle) : 0;
+		if (ek_handle)
+		{
+			start_auth_session(this, ek_handle);
+		}
+	}
 
 	while (bytes > 0)
 	{
