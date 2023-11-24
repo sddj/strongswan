@@ -21,6 +21,7 @@
 #include <utils/debug.h>
 #include "curl_fetcher.h"
 
+#define CURL_NO_FMT_CHECKS 1
 #include <curl/curl.h>
 
 typedef struct private_curl_plugin_t private_curl_plugin_t;
