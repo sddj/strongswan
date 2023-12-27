@@ -195,6 +195,11 @@ START_TEST(test_shell)
 }
 END_TEST
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#undef tcase_create
+#define tcase_create(name) ({TCase *tc_ = test_case_create(name); tc_->timeout = 15; tc_;})
+#endif
+
 Suite *process_suite_create()
 {
 	Suite *s;
@@ -203,9 +208,6 @@ Suite *process_suite_create()
 	s = suite_create("process");
 
 	tc = tcase_create("return values");
-#if defined(__APPLE__) || defined(__FreeBSD__)
-	tc->timeout = 10;
-#endif
 	tcase_add_test(tc, test_retval_true);
 	tcase_add_test(tc, test_retval_false);
 	suite_add_tcase(s, tc);
